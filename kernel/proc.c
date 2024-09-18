@@ -13,6 +13,7 @@ struct proc proc[NPROC];
 struct proc *initproc;
 
 int nextpid = 1;
+unsigned long int s_iSeed = 1;
 struct spinlock pid_lock;
 
 extern void forkret(void);
@@ -106,6 +107,7 @@ allocpid()
 // If found, initialize state required to run in the kernel,
 // and return with p->lock held.
 // If there are no free procs, or a memory allocation fails, return 0.
+//Might need to set tickets to default here
 static struct proc*
 allocproc(void)
 {
@@ -124,6 +126,8 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  p->color = 0; //Default Color
+  p->numTickets = 1; //Default tickets
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -169,6 +173,8 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  p->numTickets = 0;
+  p->color = 0;
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -289,6 +295,7 @@ fork(void)
   }
 
   // Copy user memory from parent to child.
+  //Might need to add tickets here
   if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
     freeproc(np);
     release(&np->lock);
@@ -320,6 +327,9 @@ fork(void)
 
   acquire(&np->lock);
   np->state = RUNNABLE;
+
+  //Added parent tickets to child
+  np->numTickets = p->numTickets;
   release(&np->lock);
 
   return pid;
@@ -446,27 +456,69 @@ scheduler(void)
 {
   struct proc *p;
   struct cpu *c = mycpu();
-  
+  int chances;
+  int proccesesRan;
+  int mostTickets;
+
   c->proc = 0;
-  for(;;){
+  for(;;) {
     // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
+    proccesesRan = 0;
+    mostTickets = 0;
 
+    //Calculate the number for 1/200 odds, .005 (.5%) chances for all runnable processes
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
       if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
 
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
+        //Remember the process with the most tickets in case all processes fail roll(s)
+        if(p->numTickets > mostTickets) {
+          mostTickets = p->numTickets;
+        }
+
+        //Rolling time baby
+        for(int i = 0; i < p->numTickets; i++) {
+          chances = 200;
+
+          //If the process has rolled 60 times give the process increased chances to .05 (5%)
+          if(p->numRollsUntilWin >= 60)
+            chances = 20;
+          
+          int roll = rand() % chances;
+
+          //if the number generated is equal to 1 allow process to run or if a process has rolled 75 times pity them and let them run.
+          if(roll == 1 || p->numRollsUntilWin == 75) {
+            p->state = RUNNING;
+            c->proc = p;
+            swtch(&c->context, &p->context);
+            p->ticks++;
+            p->numRollsUntilWin = 0;
+            c->proc = 0;
+            proccesesRan++;
+          }
+          else {
+            p->numRollsUntilWin++;
+          }
+
+        }
       }
       release(&p->lock);
+    }
+
+    //If no processes were able to win the rolling run the processes that spent the most "money".
+    if(proccesesRan == 0) {
+      for(p = proc; p < &proc[NPROC]; p++) {
+        acquire(&p->lock);
+        if(p->state == RUNNABLE && (p->numTickets == mostTickets)) {
+          p->state = RUNNING;
+          c->proc = p;
+          swtch(&c->context, &p->context);
+          p->ticks += 1;
+          c->proc = 0;
+        }
+        release(&p->lock);
+      }
     }
   }
 }
@@ -680,4 +732,71 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+int setColor(enum COLOR colorRequest)
+{
+  struct proc *p = myproc();
+  if((colorRequest >= RED) && (colorRequest <= VIOLET))
+  {
+    p->color = colorRequest;
+    return 0;
+  }
+
+  //Fail case
+  return -1;
+}
+
+int setTickets(int ticketRequest)
+{
+  struct proc *p = myproc();
+
+  if((ticketRequest >= 1) && (ticketRequest <= 256))
+  {
+    p->numTickets = ticketRequest;
+    return 0;
+  }
+
+  //Fail case
+  return -1;
+}
+
+int getpinfo(struct pstat *p)
+{
+  if(p == ((void*)0))
+    return -1;
+
+  for(int i = 0; i < NPROC; i++)
+  {
+      //Copy name from proc into pstat
+      for(int j = 0; j < 16; j++)
+      {
+        p->name[i][j] = proc[i].name[j];
+      }
+      
+      if(proc[i].state == UNUSED) p->inuse[i] = 0;
+      else p->inuse[i] = 1;
+
+      p->state[i] = proc[i].state;
+      p->tickets[i] = proc[i].numTickets;
+      p->pid[i] = proc[i].pid;
+      p->color[i] = proc[i].color;
+      p->ticks[i] = proc[i].ticks; 
+      //Ticks is not needed
+  }
+
+  return 0;
+}
+
+void srand(unsigned int seed)
+{
+  s_iSeed = seed;
+}
+
+unsigned int rand()
+{
+  s_iSeed ^= s_iSeed << 13;
+  s_iSeed ^= s_iSeed >> 17;
+  s_iSeed ^= s_iSeed << 5;
+  return s_iSeed;
 }
